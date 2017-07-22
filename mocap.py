@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+import ftpConn
+
 import numpy as np
 import cv2
 import time
@@ -10,8 +12,8 @@ import copy
 import imutils
 import datetime
 import threading
-import ftpConn
 import queue
+import subprocess
 from collections import deque
 
 MOTION_FRAME_WIDTH = 300
@@ -37,6 +39,13 @@ def parseArgs():
             default=80, dest='preframes',
             help="prior non motion frames to keep")
 
+    ap.add_argument("-w", "--ftpwd", type=str, \
+            default='/', dest='ftpwd',
+            help="ftp working dir")
+
+    ap.add_argument("-t", "--rotation", type=int, \
+            default=0, dest='rotation',
+            help="video rotation")
 
     args = vars(ap.parse_args())
     try:
@@ -161,33 +170,43 @@ def keepCapturing(firstFrame, cap):
 
     return L
 
-def initFtp():
+def initFtp(wd=None):
     c = ftpConn.Creds()
-    wd = "htdocs/python_test/"
-    return ftpConn.ftpConn(c.host,c.user,c.passwd,wd)
+    if not wd:
+        log.error("Need a ftp wd")
+    else:
+        return ftpConn.ftpConn(c.host,c.user,c.passwd,wd)
 
-def cleanupFtp():
-    ftp = initFtp()
-    ftpConn.rmOldFiles(ftp,limitSeconds=60*60*24*2)
-    ftp.quit()
-
-def sendToFtp(outfile):
-    ftp = initFtp()
+def sendToFtp(outfile,wd):
+    ftp = initFtp(wd)
     ftp.uploadFile(outfile)
     log.info("sent to ftp %s" % outfile)
     ftp.quit()
 
-def ftpOut(ftpQ):
+def ftpOut(ftpQ,wd):
     while True:
         outfile = ftpQ.get()
         try:
-            sendToFtp(outfile)
+            sendToFtp(outfile,wd)
         except Exception as e:
             log.error("sendToFtp error: %s" % e)
         finally:
             log.debug("sendToFtp() done")
 
-def writeOut(writeQ, ftpQ):
+def rotate(img, rotation):
+    h,w = img.shape[:2]
+    cX, cY = w//2, h//2
+    M = cv2.getRotationMatrix2D((cX, cY),rotation,1.0)
+    cos = np.abs(M[0,0])
+    sin = np.abs(M[0,1])
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+    M[0, 2] += (nW / 2) - cX
+    M[1, 2] += (nH / 2) - cY
+
+    return cv2.warpAffine(img,M,(nW,nH))
+
+def writeOut(writeQ, ftpQ, rotation):
     while True:
         D = writeQ.get()
         fourcc = cv2.VideoWriter_fourcc(*'X264')
@@ -199,11 +218,23 @@ def writeOut(writeQ, ftpQ):
         out = cv2.VideoWriter(outfile ,fourcc, FPS, (w,h))
         log.debug("size of deque %d" % len(D))
         for f in D:
+            f = rotate(f,rotation)
             out.write(f)
         out.release()
         log.info("wrote %s" % (outfile))
         ftpQ.put(outfile)
 
+
+def getFreeMem():
+    p = subprocess.Popen(
+        ['./getFreeMem.sh'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        )
+    stdout,stderr = p.communicate()
+    #log.debug('stdout ' + stdout.decode('utf8'))
+    #log.debug('stderr ' + stderr.decode('utf8'))
+    log.debug("Freemem = %s" % stdout)
 
 def motion(cap, args, writeQ):
     motionFrameFirst = []
@@ -231,7 +262,8 @@ def motion(cap, args, writeQ):
             RawFrames = keepCapturing(motionFrameFirst[0], cap)
 
             try:
-                writeQ.put(deque(list(DRaw)+ RawFrames))
+                writeQ.put(list(DRaw)+ RawFrames)
+                getFreeMem()
             except Exception as e:
                 log.error("Could not put onto writeQ: %s"  % e)
 
@@ -250,14 +282,14 @@ if __name__ == "__main__":
 
     threading.Thread(
             target=writeOut,
-            args=(writeQ,ftpQ,),
+            args=(writeQ,ftpQ,args['rotation'],),
             daemon=True,
             name='genVid',
             ).start()
 
     threading.Thread(
             target=ftpOut,
-            args=(ftpQ,),
+            args=(ftpQ,args['ftpwd'],),
             daemon=True,
             name='ftpOut',
             ).start()
